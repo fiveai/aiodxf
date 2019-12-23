@@ -13,7 +13,7 @@ setup(
     long_description=read('README.rst'),
     keywords='docker registry',
     author='FiveAI Ltd.',
-    author_email='dave@davedoesdev.com',
+    author_email='will.gardner@five.ai',
     url='https://github.com/fiveai/aiodxf',
     license='MIT',
     packages=['aiodxf'],
