@@ -8,9 +8,9 @@ def read(name):
 
 setup(
     name='aiodxf',
-    version='7.5.3',
+    version='7.5.3-1',
     description="Package for accessing a Docker v2 registry",
-    long_description=read('README.rst'),
+    long_description=read('README.md'),
     keywords='docker registry',
     author='FiveAI Ltd.',
     author_email='will.gardner@five.ai',
