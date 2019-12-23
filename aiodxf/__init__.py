@@ -16,29 +16,18 @@ except ImportError:
     from urllib import urlencode
     import urlparse
 
-import requests
-try:
-    from requests.packages import urllib3
-except ImportError:
-    import urllib3
-from urllib3.exceptions import InsecureRequestWarning
+import aiohttp
+import aiohttp.web
 
 from jwcrypto import jwk, jws
 import www_authenticate
 # pylint: disable=wildcard-import
-from dxf import exceptions
+from aiodxf import exceptions
 
 _schema2_mimetype = 'application/vnd.docker.distribution.manifest.v2+json'
 
-if sys.version_info < (3, 0):
-    _binary_type = str
-else:
-    _binary_type = bytes
-    # pylint: disable=redefined-builtin
-    long = int
-
 def _to_bytes_2and3(s):
-    return s if isinstance(s, _binary_type) else s.encode('utf-8')
+    return s if isinstance(s, bytes) else s.encode('utf-8')
 
 def hash_bytes(buf):
     """
@@ -72,7 +61,7 @@ def hash_file(filename):
 
 def _raise_for_status(r):
     # pylint: disable=no-member
-    if r.status_code == requests.codes.unauthorized:
+    if r.status ==aiohttp.web.HTTPUnauthorized.status_code:
         raise exceptions.DXFUnauthorizedError()
     r.raise_for_status()
 
@@ -128,14 +117,28 @@ class PaginatingResponse(object):
         self._path = path
         self._header = header
         self._kwargs = kwargs
-    def __iter__(self):
-        while self._path:
-            response = self._meth('get', self._path, **self._kwargs)
-            self._kwargs = {}
-            for v in response.json()[self._header] or []:
-                yield v
-            nxt = response.links.get('next')
-            self._path = nxt['url'] if nxt else None
+        self._response = None
+        self._elements = []
+
+    def __aiter__(self):
+        return self
+    
+    async def __anext__(self):
+        if not self._path and not self._elements:
+            raise StopAsyncIteration
+        
+        if self._elements:
+            return self._elements.pop(0)
+
+        response = await self._meth('get', self._path, **self._kwargs)
+        self._elements = (await response.json())[self._header] or []
+        self._kwargs = {}
+        nxt = response.links.get('next')
+        self._path = nxt['url'] if nxt else None
+
+        if self._elements:
+            return self._elements.pop(0)
+        raise StopAsyncIteration
 
 def _ignore_warnings(obj):
     # pylint: disable=protected-access
@@ -149,7 +152,7 @@ class DXFBase(object):
     Contains only operations which aren't related to repositories.
 
     Can act as a context manager. For each context entered, a new
-    `requests.Session <http://docs.python-requests.org/en/latest/user/advanced/#session-objects>`_
+    `aiohttp.ClientSession <https://docs.aiohttp.org/en/latest/client_reference.html#client-session>`_
     is obtained. Connections to the same host are shared by the session.
     When the context exits, all the session's connections are closed.
 
@@ -184,7 +187,7 @@ class DXFBase(object):
         self._token = None
         self._headers = {}
         self._repo = None
-        self._sessions = [requests]
+        self._sessions = []
         self._tlsverify = tlsverify
 
     @property
@@ -203,9 +206,11 @@ class DXFBase(object):
             'Authorization': 'Bearer ' + value
         }
 
-    def _base_request(self, method, path, **kwargs):
+    async def _base_request(self, method, path, **kwargs):
+        if 'params' in kwargs:
+            kwargs['params'] =  {k: v for k, v in kwargs['params'].items() if v is not None}
         def make_kwargs():
-            r = {'allow_redirects': True, 'verify': self._tlsverify}
+            r = {'allow_redirects': True, 'ssl': self._tlsverify}
             r.update(kwargs)
             if 'headers' not in r:
                 r['headers'] = {}
@@ -214,57 +219,46 @@ class DXFBase(object):
         url = urlparse.urljoin(self._base_url, path)
         with warnings.catch_warnings():
             _ignore_warnings(self)
-            r = getattr(self._sessions[0], method)(url, **make_kwargs())
+            r = await getattr(self._sessions[0], method)(url, **make_kwargs())
         # pylint: disable=no-member
-        if r.status_code == requests.codes.unauthorized and self._auth:
+        if r.status == aiohttp.web.HTTPUnauthorized.status_code and self._auth:
             headers = self._headers
-            self._auth(self, r)
+            await self._auth(self, r)
             if self._headers != headers:
                 with warnings.catch_warnings():
                     _ignore_warnings(self)
-                    r = getattr(self._sessions[0], method)(url, **make_kwargs())
+                    r = await getattr(self._sessions[0], method)(url, **make_kwargs())
         _raise_for_status(r)
         return r
 
-    def authenticate(self,
-                     username=None, password=None,
-                     actions=None, response=None,
-                     authorization=None):
+    async def authenticate(self,
+                     username: str=None, password: str=None,
+                     actions: list=None, response: aiohttp.ClientResponse=None,
+                     authorization: str=None) -> str:
         # pylint: disable=too-many-arguments,too-many-locals
         """
         Authenticate to the registry using a username and password,
         an authorization header or otherwise as the anonymous user.
 
         :param username: User name to authenticate as.
-        :type username: str
-
         :param password: User's password.
-        :type password: str
-
         :param actions: If you know which types of operation you need to make on the registry, specify them here. Valid actions are ``pull``, ``push`` and ``*``.
-        :type actions: list
-
         :param response: When the ``auth`` function you passed to :class:`DXFBase`'s constructor is called, it is passed a HTTP response object. Pass it back to :meth:`authenticate` to have it automatically detect which actions are required.
-        :type response: requests.Response
-
         :param authorization: ``Authorization`` header value.
-        :type authorization: str
-
-        :rtype: str
         :returns: Authentication token, if the registry supports bearer tokens. Otherwise ``None``, and HTTP Basic auth is used (if the registry requires authentication).
         """
         if response is None:
             with warnings.catch_warnings():
                 _ignore_warnings(self)
-                response = self._sessions[0].get(self._base_url, verify=self._tlsverify)
+                response = await self._sessions[0].get(self._base_url, ssl=self._tlsverify)
 
-        if response.ok:
+        if response.status == 200:
             return None
 
         # pylint: disable=no-member
-        if response.status_code != requests.codes.unauthorized:
-            raise exceptions.DXFUnexpectedStatusCodeError(response.status_code,
-                                                          requests.codes.unauthorized)
+        if response.status != aiohttp.web.HTTPUnauthorized.status_code:
+            raise exceptions.DXFUnexpectedStatusCodeError(response.status,
+                                                          aiohttp.web.HTTPUnauthorized.status_code)
 
         if self._insecure:
             raise exceptions.DXFAuthInsecureError()
@@ -303,9 +297,9 @@ class DXFBase(object):
             auth_url = urlparse.urlunparse(url_parts)
             with warnings.catch_warnings():
                 _ignore_warnings(self)
-                r = self._sessions[0].get(auth_url, headers=headers, verify=self._tlsverify)
+                r = await self._sessions[0].get(auth_url, headers=headers, ssl=self._tlsverify)
             _raise_for_status(r)
-            rjson = r.json()
+            rjson = await r.json()
             # Use 'access_token' value if present and not empty, else 'token' value.
             self.token = rjson.get('access_token') or rjson['token']
             return self._token
@@ -331,17 +325,16 @@ class DXFBase(object):
                                 params={'n': batch_size})
         return it if iterate else list(it)
 
-    def __enter__(self):
-        assert self._sessions
-        session = requests.Session()
-        session.__enter__()
+    async def __aenter__(self):
+        session = aiohttp.ClientSession()
+        await session.__aenter__()
         self._sessions.insert(0, session)
         return self
 
-    def __exit__(self, *args):
-        assert len(self._sessions) > 1
+    async def __aexit__(self, *args):
+        assert self._sessions
         session = self._sessions.pop(0)
-        return session.__exit__(*args)
+        return await session.__aexit__(*args)
 
 class DXF(DXFBase):
     """
@@ -372,12 +365,12 @@ class DXF(DXFBase):
         self._repo = repo
         self._repo_path = (repo + '/') if repo else ''
 
-    def _request(self, method, path, **kwargs):
-        return super(DXF, self)._base_request(method,
+    async def _request(self, method, path, **kwargs):
+        return await super(DXF, self)._base_request(method,
                                               self._repo_path + path,
                                               **kwargs)
 
-    def push_blob(self,
+    async def push_blob(self,
                   filename=None,
                   progress=None,
                   data=None, digest=None,
@@ -413,13 +406,13 @@ class DXF(DXFBase):
             dgst = hash_file(filename)
         if check_exists:
             try:
-                self._request('head', 'blobs/' + dgst)
+                await self._request('head', 'blobs/' + dgst)
                 return dgst
             except requests.exceptions.HTTPError as ex:
                 # pylint: disable=no-member
-                if ex.response.status_code != requests.codes.not_found:
+                if ex.response.status != aiohttp.web.HTTPUnauthorized.NotFound:
                     raise
-        r = self._request('post', 'blobs/uploads/')
+        r = await self._request('post', 'blobs/uploads/')
         upload_url = r.headers['Location']
         url_parts = list(urlparse.urlparse(upload_url))
         query = urlparse.parse_qs(url_parts[4])
@@ -433,11 +426,11 @@ class DXF(DXFBase):
         else:
             with open(filename, 'rb') as f:
                 data = _ReportingFile(dgst, f, progress) if progress else f
-                self._base_request('put', upload_url, data=data)
+                await self._base_request('put', upload_url, data=data)
         return dgst
 
     # pylint: disable=no-self-use
-    def pull_blob(self, digest, size=False, chunk_size=None):
+    async def pull_blob(self, digest, size=False, chunk_size=None):
         """
         Download a blob from the registry given the hash of its content.
 
@@ -455,7 +448,7 @@ class DXF(DXFBase):
         """
         if chunk_size is None:
             chunk_size = 8192
-        r = self._request('get', 'blobs/' + digest, stream=True)
+        r = await self._request('get', 'blobs/' + digest, stream=True)
         class Chunks(object):
             # pylint: disable=too-few-public-methods
             def __iter__(self):
@@ -466,29 +459,29 @@ class DXF(DXFBase):
                 dgst = 'sha256:' + sha256.hexdigest()
                 if dgst != digest:
                     raise exceptions.DXFDigestMismatchError(dgst, digest)
-        return (Chunks(), long(r.headers['content-length'])) if size else Chunks()
+        return (Chunks(), int(r.headers['content-length'])) if size else Chunks()
 
-    def blob_size(self, digest):
+    async def blob_size(self, digest):
         """
         Return the size of a blob in the registry given the hash of its content.
 
         :param digest: Hash of the blob's content (prefixed by ``sha256:``).
         :type digest: str
 
-        :rtype: long
+        :rtype: int
         :returns: Size of the blob in bytes.
         """
-        r = self._request('head', 'blobs/' + digest)
-        return long(r.headers['content-length'])
+        r = await self._request('head', 'blobs/' + digest)
+        return int(r.headers['content-length'])
 
-    def del_blob(self, digest):
+    async def del_blob(self, digest):
         """
         Delete a blob from the registry given the hash of its content.
 
         :param digest: Hash of the blob's content (prefixed by ``sha256:``).
         :type digest: str
         """
-        self._request('delete', 'blobs/' + digest)
+        await self._request('delete', 'blobs/' + digest)
 
     # For dtuf; highly unlikely anyone else will want this
     def make_manifest(self, *digests):
@@ -511,7 +504,7 @@ class DXF(DXFBase):
             'layers': layers
         }, sort_keys=True)
 
-    def set_manifest(self, alias, manifest_json):
+    async def set_manifest(self, alias, manifest_json):
         """
         Give a name (alias) to a manifest.
 
@@ -521,12 +514,12 @@ class DXF(DXFBase):
         :param manifest_json: A V2 Schema 2 manifest JSON string
         :type digests: list
         """
-        self._request('put',
+        await self._request('put',
                       'manifests/' + alias,
                       data=manifest_json,
                       headers={'Content-Type': _schema2_mimetype})
 
-    def set_alias(self, alias, *digests):
+    async def set_alias(self, alias, *digests):
         # pylint: disable=too-many-locals
         """
         Give a name (alias) to a set of blobs. Each blob is specified by
@@ -547,14 +540,14 @@ class DXF(DXFBase):
             return manifest_json
         except requests.exceptions.HTTPError as ex:
             # pylint: disable=no-member
-            if ex.response.status_code != requests.codes.bad_request:
+            if ex.response.status != aiohttp.web.BadRequest.status_code:
                 raise
             manifest_json = self.make_unsigned_manifest(alias, *digests)
             signed_json = _sign_manifest(manifest_json)
-            self._request('put', 'manifests/' + alias, data=signed_json)
+            await self._request('put', 'manifests/' + alias, data=signed_json)
             return signed_json
 
-    def get_manifest_and_response(self, alias):
+    async def get_manifest_and_response(self, alias):
         """
         Request the manifest for an alias and return the manifest and the
         response.
@@ -565,13 +558,13 @@ class DXF(DXFBase):
         :rtype: tuple
         :returns: Tuple containing the manifest as a string (JSON) and the `requests.Response <http://docs.python-requests.org/en/master/api/#requests.Response>`_
         """
-        r = self._request('get',
+        r = await self._request('get',
                           'manifests/' + alias,
                           headers={'Accept': _schema2_mimetype + ', ' +
                                              _schema1_mimetype})
-        return r.content.decode('utf-8'), r
+        return (await r.text("utf-8")), r
 
-    def get_manifest(self, alias):
+    async def get_manifest(self, alias):
         """
         Get the manifest for an alias
 
@@ -581,13 +574,13 @@ class DXF(DXFBase):
         :rtype: str
         :returns: The manifest as string (JSON)
         """
-        manifest, _ = self.get_manifest_and_response(alias)
+        manifest, _ = await self.get_manifest_and_response(alias)
         return manifest
 
-    def _get_alias(self, alias, manifest, verify, sizes, dcd, get_digest):
+    async def _get_alias(self, alias, manifest, verify, sizes, dcd, get_digest):
         # pylint: disable=too-many-arguments
         if alias:
-            manifest, r = self.get_manifest_and_response(alias)
+            manifest, r = await self.get_manifest_and_response(alias)
             dcd = r.headers['docker-content-digest']
 
         parsed_manifest = json.loads(manifest)
@@ -610,7 +603,7 @@ class DXF(DXFBase):
         if dcd:
             method, expected_dgst = split_digest(dcd)
             hasher = hashlib.new(method)
-            hasher.update(r.content)
+            hasher.update(await r.read())
             dgst = hasher.hexdigest()
             if dgst != expected_dgst:
                 raise exceptions.DXFDigestMismatchError(
@@ -690,7 +683,7 @@ class DXF(DXFBase):
         """
         return self._get_alias(alias, manifest, verify, False, dcd, True)
 
-    def _get_dcd(self, alias):
+    async def _get_dcd(self, alias):
         """
         Get the Docker-Content-Digest header for an alias.
 
@@ -705,13 +698,13 @@ class DXF(DXFBase):
         # the following header must be used when HEAD or GET-ing the manifest
         # to obtain the correct digest to delete:
         # Accept: application/vnd.docker.distribution.manifest.v2+json
-        return self._request(
+        return (await self._request(
             'head',
             'manifests/{}'.format(alias),
             headers={'Accept': _schema2_mimetype},
-        ).headers.get('Docker-Content-Digest')
+        )).headers.get('Docker-Content-Digest')
 
-    def del_alias(self, alias):
+    async def del_alias(self, alias):
         """
         Delete an alias from the registry. The blobs it points to won't be deleted. Use :meth:`del_blob` for that.
 
@@ -725,9 +718,9 @@ class DXF(DXFBase):
         :rtype: list
         :returns: A list of blob hashes (strings) which were assigned to the alias.
         """
-        dcd = self._get_dcd(alias)
-        dgsts = self.get_alias(alias)
-        self._request('delete', 'manifests/{}'.format(dcd))
+        dcd = await self._get_dcd(alias)
+        dgsts = await self.get_alias(alias)
+        await self._request('delete', 'manifests/{}'.format(dcd))
         return dgsts
 
     def list_aliases(self, batch_size=None, iterate=False):
@@ -748,14 +741,14 @@ class DXF(DXFBase):
                                 params={'n': batch_size})
         return it if iterate else list(it)
 
-    def api_version_check(self):
+    async def api_version_check(self):
         """
         Performs API version check
 
         :rtype: tuple
         :returns: verson check response as a string (JSON) and requests.Response
         """
-        r = self._base_request('get', '')
+        r = await self._base_request('get', '')
         return r.content.decode('utf-8'), r
 
     @classmethod

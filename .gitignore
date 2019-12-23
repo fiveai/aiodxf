@@ -10,5 +10,5 @@
 /test/ca.*
 /python
 /dist
-/python_dxf.egg-info
+/aiodxf.egg-info
 /build

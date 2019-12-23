@@ -7,7 +7,7 @@ def read(name):
     return io.open(file_path, encoding='utf8').read()
 
 setup(
-    name='python-dxf',
+    name='aiodxf',
     version='7.5.3',
     description="Package for accessing a Docker v2 registry",
     long_description=read('README.rst'),
@@ -16,10 +16,10 @@ setup(
     author_email='dave@davedoesdev.com',
     url='https://github.com/davedoesdev/dxf',
     license='MIT',
-    packages=['dxf'],
-    entry_points={'console_scripts': ['dxf=dxf.main:main']},
+    packages=['aiodxf'],
+    entry_points={'console_scripts': ['aiodxf=aiodxf.main:main']},
     install_requires=['www-authenticate>=0.9.2',
-                      'requests>=2.18.4',
+                      'aiohttp==3.6.2',
                       'jwcrypto>=0.4.2',
                       'tqdm>=4.19.4']
 )

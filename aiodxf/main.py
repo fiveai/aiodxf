@@ -1,13 +1,16 @@
 #pylint: disable=wrong-import-position,wrong-import-order,superfluous-parens
+import asyncio
 import os
 import argparse
 import sys
 import traceback
 import errno
 import tqdm
-import dxf
-import dxf.exceptions
-import requests.exceptions
+
+import aiohttp.web
+
+import aiodxf
+import aiodxf.exceptions
 
 _choices = ['auth',
             'push-blob',
@@ -33,7 +36,7 @@ def _flatten(l):
     return [item for sublist in l for item in sublist]
 
 # pylint: disable=too-many-statements
-def doit(args, environ):
+async def doit(args, environ):
     dxf_progress = environ.get('DXF_PROGRESS')
     if dxf_progress == '1' or (dxf_progress != '0' and sys.stderr.isatty()):
         bars = {}
@@ -56,31 +59,31 @@ def doit(args, environ):
     else:
         dxf_tlsverify = environ.get('DXF_TLSVERIFY', True)
 
-    def auth(dxf_obj, response):
+    async def auth(dxf_obj, response):
         # pylint: disable=redefined-outer-name
         username = environ.get('DXF_USERNAME')
         password = environ.get('DXF_PASSWORD')
         authorization = environ.get('DXF_AUTHORIZATION')
-        dxf_obj.authenticate(username, password,
+        await dxf_obj.authenticate(username, password,
                              response=response,
                              authorization=authorization)
 
     args = _parser.parse_args(args)
     if args.op != 'list-repos':
-        dxf_obj = dxf.DXF(environ['DXF_HOST'],
+        dxf_obj = aiodxf.DXF(environ['DXF_HOST'],
                           args.repo,
                           auth,
                           environ.get('DXF_INSECURE') == '1',
                           environ.get('DXF_AUTH_HOST'),
                           tlsverify=dxf_tlsverify)
     else:
-        dxf_obj = dxf.DXFBase(environ['DXF_HOST'],
+        dxf_obj = aiodxf.DXFBase(environ['DXF_HOST'],
                               auth,
                               environ.get('DXF_INSECURE') == '1',
                               environ.get('DXF_AUTH_HOST'),
                               tlsverify=dxf_tlsverify)
 
-    def _doit():
+    async def _doit():
         # pylint: disable=too-many-branches
         if args.op == "auth":
             username = environ.get('DXF_USERNAME')
@@ -104,9 +107,9 @@ def doit(args, environ):
                 _parser.error('too many arguments')
             if len(args.args) == 2 and not args.args[1].startswith('@'):
                 _parser.error('invalid alias')
-            dgst = dxf_obj.push_blob(args.args[0], progress)
+            dgst = await dxf_obj.push_blob(args.args[0], progress)
             if len(args.args) == 2:
-                dxf_obj.set_alias(args.args[1][1:], dgst)
+                await dxf_obj.set_alias(args.args[1][1:], dgst)
             print(dgst)
 
         elif args.op == "pull-blob":
@@ -116,9 +119,9 @@ def doit(args, environ):
                                   if name.startswith('@') else [name]
                                   for name in args.args])
             else:
-                dgsts = dxf_obj.get_alias(manifest=sys.stdin.read())
+                dgsts = await dxf_obj.get_alias(manifest=sys.stdin.read())
             for dgst in dgsts:
-                it, size = dxf_obj.pull_blob(
+                it, size = await dxf_obj.pull_blob(
                     dgst, size=True, chunk_size=environ.get('DXF_CHUNK_SIZE'))
                 if environ.get('DXF_BLOB_INFO') == '1':
                     print(dgst + ' ' + str(size))
@@ -131,71 +134,72 @@ def doit(args, environ):
 
         elif args.op == 'blob-size':
             if args.args:
-                sizes = [dxf_obj.get_alias(name[1:], sizes=True)
+                sizes = [await dxf_obj.get_alias(name[1:], sizes=True)
                          if name.startswith('@') else
-                         [(name, dxf_obj.blob_size(name))]
+                         [(name, await dxf_obj.blob_size(name))]
                          for name in args.args]
             else:
-                sizes = [dxf_obj.get_alias(manifest=sys.stdin.read(),
+                sizes = [await dxf_obj.get_alias(manifest=sys.stdin.read(),
                                            sizes=True)]
             for tuples in sizes:
                 print(sum([size for _, size in tuples]))
 
         elif args.op == 'del-blob':
             if args.args:
-                dgsts = _flatten([dxf_obj.del_alias(name[1:])
+                dgsts = _flatten([await dxf_obj.del_alias(name[1:])
                                   if name.startswith('@') else [name]
                                   for name in args.args])
             else:
-                dgsts = dxf_obj.get_alias(manifest=sys.stdin.read())
+                dgsts = await dxf_obj.get_alias(manifest=sys.stdin.read())
             for dgst in dgsts:
-                dxf_obj.del_blob(dgst)
+                await dxf_obj.del_blob(dgst)
 
         elif args.op == "set-alias":
             if len(args.args) < 2:
                 _parser.error('too few arguments')
-            dgsts = [dxf.hash_file(dgst) if os.sep in dgst else dgst
+            dgsts = [aiodxf.hash_file(dgst) if os.sep in dgst else dgst
                      for dgst in args.args[1:]]
-            sys.stdout.write(dxf_obj.set_alias(args.args[0], *dgsts))
+            sys.stdout.write(await dxf_obj.set_alias(args.args[0], *dgsts))
 
         elif args.op == "get-alias":
             if args.args:
-                dgsts = _flatten([dxf_obj.get_alias(name) for name in args.args])
+                dgsts = _flatten([await dxf_obj.get_alias(name) for name in args.args])
             else:
-                dgsts = dxf_obj.get_alias(manifest=sys.stdin.read())
+                dgsts = await dxf_obj.get_alias(manifest=sys.stdin.read())
             for dgst in dgsts:
                 print(dgst)
 
         elif args.op == "del-alias":
             for name in args.args:
-                for dgst in dxf_obj.del_alias(name):
+                for dgst in await dxf_obj.del_alias(name):
                     print(dgst)
 
         elif args.op == 'get-digest':
             if args.args:
-                dgsts = [dxf_obj.get_digest(name) for name in args.args]
+                dgsts = [await dxf_obj.get_digest(name) for name in args.args]
             else:
-                dgsts = [dxf_obj.get_digest(manifest=sys.stdin.read())]
+                dgsts = [await dxf_obj.get_digest(manifest=sys.stdin.read())]
             for dgst in dgsts:
                 print(dgst)
 
         elif args.op == 'list-aliases':
             if args.args:
                 _parser.error('too many arguments')
-            for name in dxf_obj.list_aliases(iterate=True):
+            async for name in dxf_obj.list_aliases(iterate=True):
                 print(name)
 
         elif args.op == 'list-repos':
-            for name in dxf_obj.list_repos(iterate=True):
+            for name in await dxf_obj.list_repos(iterate=True):
                 print(name)
 
     try:
-        _doit()
+        async with dxf_obj:
+            await _doit()
         return 0
-    except dxf.exceptions.DXFUnauthorizedError:
+    except aiodxf.exceptions.DXFUnauthorizedError:
         traceback.print_exc()
         return errno.EACCES
-    except requests.exceptions.HTTPError as ex:
+    except aiohttp.web.HTTPClientError as ex:
         # pylint: disable=no-member
         if ex.response.status_code == requests.codes.not_found:
             traceback.print_exc()
@@ -203,4 +207,4 @@ def doit(args, environ):
         raise
 
 def main():
-    sys.exit(doit(sys.argv[1:], os.environ))
+    sys.exit(asyncio.run(doit(sys.argv[1:], os.environ)))
