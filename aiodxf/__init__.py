@@ -164,6 +164,7 @@ class _ReportingFile(object):
         return chunk
     def close(self):
         return self._f.close()
+aiohttp.payload.register_payload(aiohttp.payload.BufferedReaderPayload, _ReportingFile)
 
 class _ReportingStreamReader(aiohttp.streams.AsyncStreamReaderMixin):
     # pylint: disable=too-few-public-methods
@@ -201,6 +202,83 @@ class _ReportingStreamReader(aiohttp.streams.AsyncStreamReaderMixin):
         if chunk:
             self._cb(self._dgst, chunk)
         return chunk
+aiohttp.payload.register_payload(aiohttp.payload.StreamReaderPayload, _ReportingStreamReader)
+
+class _ChecksumStreamReader(aiohttp.streams.AsyncStreamReaderMixin):
+    # pylint: disable=too-few-public-methods
+    def __init__(self, dgst, stream):
+        self._dgst = dgst
+        self._stream = stream
+        self._sha = hashlib.sha256()
+
+    def _verify_sha(self):
+        dgst = 'sha256:' + self._sha.hexdigest()
+        if dgst != self._dgst:
+            raise exceptions.DXFDigestMismatchError(dgst, self._dgst)
+
+    def _update_sha(self, data):
+        self._sha.update(data)
+
+    async def readline(self):
+        try:
+            line = await self._stream.readline()
+        except aiohttp.streams.EofStream:
+            self._verify_sha()
+            raise
+        if line:
+            self._update_sha(line)
+        else:
+            self._verify_sha()
+        return line
+
+    async def read(self, n: int=-1):
+        try:
+            chunk = await self._stream.read(n)
+        except aiohttp.streams.EofStream:
+            self._verify_sha()
+            raise
+        if chunk:
+            self._update_sha(chunk)
+        else:
+            self._verify_sha()
+        return chunk
+
+    async def readany(self):
+        try:
+            chunk = await self._stream.readany()
+        except aiohttp.streams.EofStream:
+            self._verify_sha()
+            raise
+        if chunk:
+            self._update_sha(chunk)
+        else:
+            self._verify_sha()
+        return chunk
+
+    async def readchunk(self):
+        try:
+            chunk, ec = await self._stream.readchunk()
+        except aiohttp.streams.EofStream:
+            self._verify_sha()
+            raise
+        if chunk:
+            self._update_sha(chunk)
+        else:
+            self._verify_sha()
+        return chunk, ec
+
+    async def readexactly(self, n: int):
+        try:
+            chunk = await self._stream.readexactly()
+        except aiohttp.streams.EofStream:
+            self._verify_sha()
+            raise
+        if chunk:
+            self._update_sha(chunk)
+        else:
+            self._verify_sha()
+        return chunk
+aiohttp.payload.register_payload(aiohttp.payload.StreamReaderPayload, _ChecksumStreamReader)
 
 class PaginatingResponse(object):
     # pylint: disable=too-few-public-methods
@@ -503,11 +581,11 @@ class DXF(DXFBase):
         url_parts[0] = 'http' if self._insecure else 'https'
         upload_url = urlparse.urlunparse(url_parts)
         if filename is None:
-            data = aiohttp.payload.StreamReaderPayload(_ReportingStreamReader(dgst, data, progress)) if progress else data
+            data = _ReportingStreamReader(dgst, data, progress) if progress else data
             await self._base_request('put', upload_url, data=data)
         else:
             with open(filename, 'rb') as f:
-                data = aiohttp.payload.BufferedReaderPayload(_ReportingFile(dgst, f, progress)) if progress else f
+                data = _ReportingFile(dgst, f, progress) if progress else f
                 await self._base_request('put', upload_url, data=data)
         return dgst
 
@@ -529,7 +607,8 @@ class DXF(DXFBase):
         :returns: If ``size`` is falsey, a byte string iterator over the blob's content. If ``size`` is truthy, a tuple containing the iterator and the blob's size.
         """
         r = await self._request('get', 'blobs/' + digest)
-        return (r.content, int(r.headers['content-length'])) if size else r.content
+        content = _ChecksumStreamReader(digest, r.content)
+        return (content, int(r.headers['content-length'])) if size else content
 
     async def blob_size(self, digest):
         """

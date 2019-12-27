@@ -62,6 +62,23 @@ async def test_pull_blob(dxf_obj):
     await _pull_blob(dxf_obj, pytest.blob1_hash, None, None)
     await _pull_blob(dxf_obj, pytest.blob2_hash, pytest.blob2_size, None)
     await _pull_blob(dxf_obj, pytest.blob1_hash, None, 4096)
+    with pytest.raises(aiodxf.exceptions.DXFDigestMismatchError) as ex:
+        class DummySHA256(object):
+            # pylint: disable=no-self-use
+            def update(self, chunk):
+                pass
+            def hexdigest(self):
+                return orig_sha256().hexdigest()
+        orig_sha256 = hashlib.sha256
+        hashlib.sha256 = DummySHA256
+        try:
+            stream = await dxf_obj.pull_blob(pytest.blob1_hash)
+            async for _ in stream.iter_any():
+                pass
+        finally:
+            hashlib.sha256 = orig_sha256
+    assert ex.value.got == 'sha256:' + hashlib.sha256().hexdigest()
+    assert ex.value.expected == pytest.blob1_hash
 
 @pytest.mark.asyncio
 async def test_pull_and_push_blob(dxf_obj):
