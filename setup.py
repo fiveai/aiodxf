@@ -8,7 +8,7 @@ def read(name):
 
 setup(
     name='aiodxf',
-    version='7.5.3-3',
+    version='7.5.4',
     description="Package for accessing a Docker v2 registry",
     long_description=read('README.md'),
     long_description_content_type='text/markdown',
