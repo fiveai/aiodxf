@@ -37,7 +37,7 @@ export DOCKER_REG_HOST=localhost:5000
 export DOCKER_REG_USERNAME=fred
 export DOCKER_REG_PASSWORD='!WordPass0$'
 export DOCKER_REG_REPO=fred/datalogger
-export REQUESTS_CA_BUNDLE="$PWD/ca.pem"
+export DXF_TLSVERIFY="$PWD/ca.pem"
 
 # Run the example
 ./module_example.py

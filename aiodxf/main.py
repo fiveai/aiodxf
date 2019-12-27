@@ -7,6 +7,7 @@ import traceback
 import errno
 import tqdm
 
+import aiohttp
 import aiohttp.web
 
 import aiodxf
@@ -20,9 +21,11 @@ _choices = ['auth',
             'set-alias',
             'get-alias',
             'del-alias',
-            'get-digest',
+            'get-image-id',
+            'get-manifest-digest',
             'list-aliases',
-            'list-repos']
+            'list-repos',
+            'get-manifest']
 
 _parser = argparse.ArgumentParser()
 _subparsers = _parser.add_subparsers(dest='op')
@@ -57,7 +60,7 @@ async def doit(args, environ):
     if dxf_skiptlsverify == '1':
         dxf_tlsverify = False
     else:
-        dxf_tlsverify = environ.get('DXF_TLSVERIFY', True)
+        dxf_tlsverify = environ.get('DXF_TLSVERIFY', None)
 
     async def auth(dxf_obj, response):
         # pylint: disable=redefined-outer-name
@@ -89,7 +92,7 @@ async def doit(args, environ):
             username = environ.get('DXF_USERNAME')
             password = environ.get('DXF_PASSWORD')
             authorization = environ.get('DXF_AUTHORIZATION')
-            token = dxf_obj.authenticate(username, password,
+            token = await dxf_obj.authenticate(username, password,
                                          actions=args.args,
                                          authorization=authorization)
             if token:
@@ -115,19 +118,19 @@ async def doit(args, environ):
         elif args.op == "pull-blob":
             _stdout = getattr(sys.stdout, 'buffer', sys.stdout)
             if args.args:
-                dgsts = _flatten([dxf_obj.get_alias(name[1:])
+                dgsts = _flatten([await dxf_obj.get_alias(name[1:])
                                   if name.startswith('@') else [name]
                                   for name in args.args])
             else:
                 dgsts = await dxf_obj.get_alias(manifest=sys.stdin.read())
             for dgst in dgsts:
-                it, size = await dxf_obj.pull_blob(
-                    dgst, size=True, chunk_size=environ.get('DXF_CHUNK_SIZE'))
+                chunk_size = environ.get('DXF_CHUNK_SIZE', 8192)
+                stream, size = await dxf_obj.pull_blob(dgst, size=True)
                 if environ.get('DXF_BLOB_INFO') == '1':
                     print(dgst + ' ' + str(size))
                 if progress:
                     progress(dgst, b'', size)
-                for chunk in it:
+                async for chunk in stream.iter_chunked(chunk_size):
                     if progress:
                         progress(dgst, chunk, size)
                     _stdout.write(chunk)
@@ -174,23 +177,36 @@ async def doit(args, environ):
                 for dgst in await dxf_obj.del_alias(name):
                     print(dgst)
 
-        elif args.op == 'get-digest':
+        elif args.op == 'get-image-id':
             if args.args:
-                dgsts = [await dxf_obj.get_digest(name) for name in args.args]
+                dgsts = [await dxf_obj.get_image_id(name) for name in args.args]
             else:
-                dgsts = [await dxf_obj.get_digest(manifest=sys.stdin.read())]
+                dgsts = [await dxf_obj.get_image_id(manifest=sys.stdin.read())]
+            for dgst in dgsts:
+                print(dgst)
+
+        elif args.op == 'get-manifest-digest':
+            if args.args:
+                dgsts = [await dxf_obj.get_manifest_digest(name) for name in args.args]
+            else:
+                dgsts = [await dxf_obj.get_manifest_digest(manifest=sys.stdin.read())]
             for dgst in dgsts:
                 print(dgst)
 
         elif args.op == 'list-aliases':
             if args.args:
                 _parser.error('too many arguments')
-            async for name in dxf_obj.list_aliases(iterate=True):
+            async for name in await dxf_obj.list_aliases(iterate=True):
                 print(name)
 
         elif args.op == 'list-repos':
-            for name in await dxf_obj.list_repos(iterate=True):
+            async for name in await dxf_obj.list_repos(iterate=True):
                 print(name)
+        elif args.op == 'get-manifest':
+            manifests = [await dxf_obj.get_manifest(name) for name in args.args]
+            for manifest in manifests:
+                print(manifest)
+
 
     try:
         async with dxf_obj:
@@ -199,9 +215,9 @@ async def doit(args, environ):
     except aiodxf.exceptions.DXFUnauthorizedError:
         traceback.print_exc()
         return errno.EACCES
-    except aiohttp.web.HTTPClientError as ex:
+    except aiohttp.ClientResponseError as ex:
         # pylint: disable=no-member
-        if ex.response.status_code == requests.codes.not_found:
+        if ex.status == aiohttp.web.HTTPNotFound.status_code:
             traceback.print_exc()
             return errno.ENOENT
         raise

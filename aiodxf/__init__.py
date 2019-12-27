@@ -5,6 +5,8 @@ Module for accessing a Docker v2 Registry
 import base64
 import hashlib
 import json
+import os
+import ssl
 import sys
 import warnings
 
@@ -17,6 +19,8 @@ except ImportError:
     import urlparse
 
 import aiohttp
+import aiohttp.payload
+import aiohttp.streams
 import aiohttp.web
 
 from jwcrypto import jwk, jws
@@ -71,12 +75,73 @@ def split_digest(s):
         raise exceptions.DXFUnexpectedDigestMethodError(method, 'sha256')
     return method, digest
 
+def _super_len(o):
+    # Vendored from requests
+    total_length = None
+    current_position = 0
+
+    if hasattr(o, '__len__'):
+        total_length = len(o)
+
+    elif hasattr(o, 'len'):
+        total_length = o.len
+
+    elif hasattr(o, 'fileno'):
+        try:
+            fileno = o.fileno()
+        except io.UnsupportedOperation:
+            pass
+        else:
+            total_length = os.fstat(fileno).st_size
+
+            # Having used fstat to determine the file length, we need to
+            # confirm that this file was opened up in binary mode.
+            if 'b' not in o.mode:
+                warnings.warn((
+                    "Requests has determined the content-length for this "
+                    "request using the binary size of the file: however, the "
+                    "file has been opened in text mode (i.e. without the 'b' "
+                    "flag in the mode). This may lead to an incorrect "
+                    "content-length. In Requests 3.0, support will be removed "
+                    "for files in text mode."),
+                    FileModeWarning
+                )
+
+    if hasattr(o, 'tell'):
+        try:
+            current_position = o.tell()
+        except (OSError, IOError):
+            # This can happen in some weird situations, such as when the file
+            # is actually a special file descriptor like stdin. In this
+            # instance, we don't know what the length is, so set it to zero and
+            # let requests chunk it instead.
+            if total_length is not None:
+                current_position = total_length
+        else:
+            if hasattr(o, 'seek') and total_length is None:
+                # StringIO and BytesIO have seek but no useable fileno
+                try:
+                    # seek to end of file
+                    o.seek(0, 2)
+                    total_length = o.tell()
+
+                    # seek back to current position to support
+                    # partially read file-like objects
+                    o.seek(current_position or 0)
+                except (OSError, IOError):
+                    total_length = 0
+
+    if total_length is None:
+        total_length = 0
+
+    return max(0, total_length - current_position)
+
 class _ReportingFile(object):
     def __init__(self, dgst, f, cb):
         self._dgst = dgst
         self._f = f
         self._cb = cb
-        self._size = requests.utils.super_len(f)
+        self._size = _super_len(f)
         cb(dgst, b'', self._size)
     # define __iter__ so requests thinks we're a stream
     # (models.py, PreparedRequest.prepare_body)
@@ -97,18 +162,45 @@ class _ReportingFile(object):
         if chunk:
             self._cb(self._dgst, chunk, self._size)
         return chunk
+    def close(self):
+        return self._f.close()
 
-class _ReportingChunks(object):
+class _ReportingStreamReader(aiohttp.streams.AsyncStreamReaderMixin):
     # pylint: disable=too-few-public-methods
-    def __init__(self, dgst, data, cb):
+    def __init__(self, dgst, stream, cb):
         self._dgst = dgst
-        self._data = data
+        self._stream = stream
         self._cb = cb
-    def __iter__(self):
-        for chunk in self._data:
-            if chunk:
-                self._cb(self._dgst, chunk)
-            yield chunk
+
+    async def readline(self):
+        line = await self._stream.readline()
+        if line:
+            self._cb(self._dgst, line)
+        return line
+
+    async def read(self, n: int=-1):
+        chunk = await self._stream.read(n)
+        if chunk:
+            self._cb(self._dgst, chunk)
+        return chunk
+
+    async def readany(self):
+        chunk = await self._stream.readany()
+        if chunk:
+            self._cb(self._dgst, chunk)
+        return chunk
+
+    async def readchunk(self):
+        chunk, ec = await self._stream.readchunk()
+        if chunk:
+            self._cb(self._dgst, chunk)
+        return chunk, ec
+
+    async def readexactly(self, n: int):
+        chunk = await self._stream.readexactly()
+        if chunk:
+            self._cb(self._dgst, chunk)
+        return chunk
 
 class PaginatingResponse(object):
     # pylint: disable=too-few-public-methods
@@ -134,16 +226,11 @@ class PaginatingResponse(object):
         self._elements = (await response.json())[self._header] or []
         self._kwargs = {}
         nxt = response.links.get('next')
-        self._path = nxt['url'] if nxt else None
+        self._path = nxt['url'].path_qs if nxt else None
 
         if self._elements:
             return self._elements.pop(0)
         raise StopAsyncIteration
-
-def _ignore_warnings(obj):
-    # pylint: disable=protected-access
-    if obj._tlsverify is False:
-        warnings.filterwarnings('ignore', category=InsecureRequestWarning)
 
 class DXFBase(object):
     # pylint: disable=too-many-instance-attributes
@@ -188,7 +275,10 @@ class DXFBase(object):
         self._headers = {}
         self._repo = None
         self._sessions = []
-        self._tlsverify = tlsverify
+        
+        if isinstance(tlsverify, str):
+            tlsverify = ssl.create_default_context(cafile=tlsverify)
+        self._tlsverify = tlsverify if tlsverify is not True else None
 
     @property
     def token(self):
@@ -217,17 +307,13 @@ class DXFBase(object):
             r['headers'].update(self._headers)
             return r
         url = urlparse.urljoin(self._base_url, path)
-        with warnings.catch_warnings():
-            _ignore_warnings(self)
-            r = await getattr(self._sessions[0], method)(url, **make_kwargs())
+        r = await getattr(self._sessions[0], method)(url, **make_kwargs())
         # pylint: disable=no-member
         if r.status == aiohttp.web.HTTPUnauthorized.status_code and self._auth:
             headers = self._headers
             await self._auth(self, r)
             if self._headers != headers:
-                with warnings.catch_warnings():
-                    _ignore_warnings(self)
-                    r = await getattr(self._sessions[0], method)(url, **make_kwargs())
+                r = await getattr(self._sessions[0], method)(url, **make_kwargs())
         _raise_for_status(r)
         return r
 
@@ -248,9 +334,7 @@ class DXFBase(object):
         :returns: Authentication token, if the registry supports bearer tokens. Otherwise ``None``, and HTTP Basic auth is used (if the registry requires authentication).
         """
         if response is None:
-            with warnings.catch_warnings():
-                _ignore_warnings(self)
-                response = await self._sessions[0].get(self._base_url, ssl=self._tlsverify)
+            response = await self._sessions[0].get(self._base_url, ssl=self._tlsverify)
 
         if response.status == 200:
             return None
@@ -295,9 +379,7 @@ class DXFBase(object):
             if self._auth_host:
                 url_parts[1] = self._auth_host
             auth_url = urlparse.urlunparse(url_parts)
-            with warnings.catch_warnings():
-                _ignore_warnings(self)
-                r = await self._sessions[0].get(auth_url, headers=headers, ssl=self._tlsverify)
+            r = await self._sessions[0].get(auth_url, headers=headers, ssl=self._tlsverify)
             _raise_for_status(r)
             rjson = await r.json()
             # Use 'access_token' value if present and not empty, else 'token' value.
@@ -307,7 +389,7 @@ class DXFBase(object):
         self._headers = headers
         return None
 
-    def list_repos(self, batch_size=None, iterate=False):
+    async def list_repos(self, batch_size=None, iterate=False):
         """
         List all repositories in the registry.
 
@@ -323,7 +405,7 @@ class DXFBase(object):
         it = PaginatingResponse(self, '_base_request',
                                 '_catalog', 'repositories',
                                 params={'n': batch_size})
-        return it if iterate else list(it)
+        return it if iterate else [x async for x in it]
 
     async def __aenter__(self):
         session = aiohttp.ClientSession()
@@ -408,9 +490,9 @@ class DXF(DXFBase):
             try:
                 await self._request('head', 'blobs/' + dgst)
                 return dgst
-            except requests.exceptions.HTTPError as ex:
+            except aiohttp.ClientResponseError as ex:
                 # pylint: disable=no-member
-                if ex.response.status != aiohttp.web.HTTPUnauthorized.NotFound:
+                if ex.status != aiohttp.web.HTTPNotFound.status_code:
                     raise
         r = await self._request('post', 'blobs/uploads/')
         upload_url = r.headers['Location']
@@ -421,16 +503,16 @@ class DXF(DXFBase):
         url_parts[0] = 'http' if self._insecure else 'https'
         upload_url = urlparse.urlunparse(url_parts)
         if filename is None:
-            data = _ReportingChunks(dgst, data, progress) if progress else data
-            self._base_request('put', upload_url, data=data)
+            data = aiohttp.payload.StreamReaderPayload(_ReportingStreamReader(dgst, data, progress)) if progress else data
+            await self._base_request('put', upload_url, data=data)
         else:
             with open(filename, 'rb') as f:
-                data = _ReportingFile(dgst, f, progress) if progress else f
+                data = aiohttp.payload.BufferedReaderPayload(_ReportingFile(dgst, f, progress)) if progress else f
                 await self._base_request('put', upload_url, data=data)
         return dgst
 
     # pylint: disable=no-self-use
-    async def pull_blob(self, digest, size=False, chunk_size=None):
+    async def pull_blob(self, digest, size=False):
         """
         Download a blob from the registry given the hash of its content.
 
@@ -443,23 +525,11 @@ class DXF(DXFBase):
         :param chunk_size: Number of bytes to download at a time. Defaults to 8192.
         :type chunk_size: int
 
-        :rtype: iterator
+        :rtype: stream
         :returns: If ``size`` is falsey, a byte string iterator over the blob's content. If ``size`` is truthy, a tuple containing the iterator and the blob's size.
         """
-        if chunk_size is None:
-            chunk_size = 8192
-        r = await self._request('get', 'blobs/' + digest, stream=True)
-        class Chunks(object):
-            # pylint: disable=too-few-public-methods
-            def __iter__(self):
-                sha256 = hashlib.sha256()
-                for chunk in r.iter_content(chunk_size):
-                    sha256.update(chunk)
-                    yield chunk
-                dgst = 'sha256:' + sha256.hexdigest()
-                if dgst != digest:
-                    raise exceptions.DXFDigestMismatchError(dgst, digest)
-        return (Chunks(), int(r.headers['content-length'])) if size else Chunks()
+        r = await self._request('get', 'blobs/' + digest)
+        return (r.content, int(r.headers['content-length'])) if size else r.content
 
     async def blob_size(self, digest):
         """
@@ -484,10 +554,10 @@ class DXF(DXFBase):
         await self._request('delete', 'blobs/' + digest)
 
     # For dtuf; highly unlikely anyone else will want this
-    def make_manifest(self, *digests):
+    async def make_manifest(self, *digests):
         layers = [{
             'mediaType': 'application/octet-stream',
-            'size': self.blob_size(dgst),
+            'size': await self.blob_size(dgst),
             'digest': dgst
         } for dgst in digests]
         return json.dumps({
@@ -535,12 +605,12 @@ class DXF(DXFBase):
         :returns: The registry manifest used to define the alias. You almost definitely won't need this.
         """
         try:
-            manifest_json = self.make_manifest(*digests)
-            self.set_manifest(alias, manifest_json)
+            manifest_json = await self.make_manifest(*digests)
+            await self.set_manifest(alias, manifest_json)
             return manifest_json
-        except requests.exceptions.HTTPError as ex:
+        except aiohttp.ClientResponseError as ex:
             # pylint: disable=no-member
-            if ex.response.status != aiohttp.web.BadRequest.status_code:
+            if ex.status != aiohttp.web.HTTPBadRequest.status_code:
                 raise
             manifest_json = self.make_unsigned_manifest(alias, *digests)
             signed_json = _sign_manifest(manifest_json)
@@ -560,8 +630,7 @@ class DXF(DXFBase):
         """
         r = await self._request('get',
                           'manifests/' + alias,
-                          headers={'Accept': _schema2_mimetype + ', ' +
-                                             _schema1_mimetype})
+                          headers={'Accept': _schema2_mimetype})
         return (await r.text("utf-8")), r
 
     async def get_manifest(self, alias):
@@ -598,7 +667,7 @@ class DXF(DXFBase):
                                  dcd,
                                  verify)
 
-            return [(dgst, self.blob_size(dgst)) for dgst in r] if sizes else r
+            return [(dgst, await self.blob_size(dgst)) for dgst in r] if sizes else r
 
         if dcd:
             method, expected_dgst = split_digest(dcd)
@@ -622,7 +691,7 @@ class DXF(DXFBase):
             r.append((dgst, layer['size']) if sizes else dgst)
         return r
 
-    def get_alias(self,
+    async def get_alias(self,
                   alias=None,
                   manifest=None,
                   verify=True,
@@ -650,9 +719,9 @@ class DXF(DXFBase):
         :rtype: list
         :returns: If ``sizes`` is falsey, a list of blob hashes (strings) which are assigned to the alias. If ``sizes`` is truthy, a list of (hash,size) tuples for each blob.
         """
-        return self._get_alias(alias, manifest, verify, sizes, dcd, False)
+        return await self._get_alias(alias, manifest, verify, sizes, dcd, False)
 
-    def get_digest(self,
+    async def get_image_id(self,
                    alias=None,
                    manifest=None,
                    verify=True,
@@ -681,7 +750,7 @@ class DXF(DXFBase):
         :rtype: str
         :returns: Hash of the alias's configuration blob.
         """
-        return self._get_alias(alias, manifest, verify, False, dcd, True)
+        return await self._get_alias(alias, manifest, verify, False, dcd, True)
 
     async def _get_dcd(self, alias):
         """
@@ -704,6 +773,9 @@ class DXF(DXFBase):
             headers={'Accept': _schema2_mimetype},
         )).headers.get('Docker-Content-Digest')
 
+    async def get_manifest_digest(self, alias):
+        return await self._get_dcd(alias)
+
     async def del_alias(self, alias):
         """
         Delete an alias from the registry. The blobs it points to won't be deleted. Use :meth:`del_blob` for that.
@@ -723,7 +795,7 @@ class DXF(DXFBase):
         await self._request('delete', 'manifests/{}'.format(dcd))
         return dgsts
 
-    def list_aliases(self, batch_size=None, iterate=False):
+    async def list_aliases(self, batch_size=None, iterate=False):
         """
         List all aliases defined in the repository.
 
@@ -739,7 +811,7 @@ class DXF(DXFBase):
         it = PaginatingResponse(self, '_request',
                                 'tags/list', 'tags',
                                 params={'n': batch_size})
-        return it if iterate else list(it)
+        return it if iterate else [x async for x in it]
 
     async def api_version_check(self):
         """
@@ -749,7 +821,7 @@ class DXF(DXFBase):
         :returns: verson check response as a string (JSON) and requests.Response
         """
         r = await self._base_request('get', '')
-        return r.content.decode('utf-8'), r
+        return await r.text(), r
 
     @classmethod
     def from_base(cls, base, repo):
@@ -770,7 +842,7 @@ class DXF(DXFBase):
         r = cls(base._host, repo, base._auth, base._insecure, base._auth_host, base._tlsverify)
         r._token = base._token
         r._headers = base._headers
-        r._sessions = [base._sessions[0]]
+        r._sessions = []
         return r
 
 # v1 schema support functions below

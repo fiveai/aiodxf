@@ -1,11 +1,12 @@
+import asyncio
 import os
 import subprocess
 import time
 import base64
 import requests
 import pytest
-import dxf
-import dxf.main
+import aiodxf
+import aiodxf.main
 
 # From https://pytest.org/latest/example/simple.html#making-test-result-information-available-in-fixtures
 # pylint: disable=no-member,unused-argument
@@ -66,7 +67,7 @@ def pytest_configure(config):
     setattr(pytest, 'username', _username)
     setattr(pytest, 'password', _password)
     # pylint: disable=protected-access
-    setattr(pytest, 'authorization', 'Basic ' + base64.b64encode(dxf._to_bytes_2and3(_username + ':' + _password)).decode('utf-8'))
+    setattr(pytest, 'authorization', 'Basic ' + base64.b64encode(aiodxf._to_bytes_2and3(_username + ':' + _password)).decode('utf-8'))
 
     setattr(pytest, 'repo', 'foo/bar')
 
@@ -74,13 +75,13 @@ def pytest_configure(config):
 
     setattr(pytest, 'copy_registry_image', copy_registry_image)
 
-def _auth_up(dxf_obj, response):
+async def _auth_up(dxf_obj, response):
     # pylint: disable=redefined-outer-name
-    dxf_obj.authenticate(pytest.username, pytest.password, response=response)
+    await dxf_obj.authenticate(pytest.username, pytest.password, response=response)
 
-def _auth_authz(dxf_obj, response):
+async def _auth_authz(dxf_obj, response):
     # pylint: disable=redefined-outer-name
-    dxf_obj.authenticate(authorization=pytest.authorization, response=response)
+    await dxf_obj.authenticate(authorization=pytest.authorization, response=response)
 
 def _get_registry_digest(regver):
     # pylint: disable=redefined-outer-name
@@ -88,7 +89,7 @@ def _get_registry_digest(regver):
                                  'inspect',
                                  'registry:{}'.format(regver),
                                  '--format={{.Id}}']).rstrip().decode('utf-8')
-    dxf.split_digest(s)
+    aiodxf.split_digest(s)
     return s
 
 def _setup_fixture(request):
@@ -141,35 +142,46 @@ for regver in [2, 2.2]:
                                 (regver, from_base, _auth_authz, True, True),
                                 (regver, from_base, _auth_authz, True, False)])
 
+@pytest.yield_fixture(scope='module')
+def event_loop(request):
+    """Create an instance of the default event loop for each test case."""
+    loop = asyncio.get_event_loop_policy().new_event_loop()
+    yield loop
+    loop.close()
+
 @pytest.fixture(scope='module', params=_fixture_params)
-def dxf_obj(request):
+async def dxf_obj(request):
     # pylint: disable=redefined-outer-name
     regver, from_base, auth, do_token, tlsverify = _setup_fixture(request)
+    tlsverify = os.environ['DXF_TLSVERIFY'] if tlsverify == True else tlsverify
 
     if from_base:
-        base = dxf.DXFBase('localhost:5000', auth, (auth is None) or (do_token is None), None, tlsverify)
-        r = dxf.DXF.from_base(base, pytest.repo)
+        base = aiodxf.DXFBase('localhost:5000', auth, (auth is None) or (do_token is None), None, tlsverify)
+        r = aiodxf.DXF.from_base(base, pytest.repo)
     else:
-        r = dxf.DXF('localhost:5000', pytest.repo, auth, (auth is None) or (do_token is None), None, tlsverify)
+        r = aiodxf.DXF('localhost:5000', pytest.repo, auth, (auth is None) or (do_token is None), None, tlsverify)
 
     r.test_do_auth = auth
     r.test_do_token = do_token
     r.regver = regver
     r.reg_digest = _get_registry_digest(regver)
 
-    for _ in range(5):
-        try:
-            if do_token is None:
-                with pytest.raises(dxf.exceptions.DXFAuthInsecureError):
-                    r.authenticate(pytest.username, pytest.password)
-                return pytest.skip()
+    async with r:
+        for _ in range(5):
+            try:
+                if do_token is None:
+                    with pytest.raises(aiodxf.exceptions.DXFAuthInsecureError):
+                        await r.authenticate(pytest.username, pytest.password)
+                    yield pytest.skip()
+                    return
 
-            assert r.list_repos() == []
+                assert await r.list_repos() == []
 
-            return r
-        except requests.exceptions.ConnectionError as ex:
-            time.sleep(1)
-    raise ex
+                yield r
+                return
+            except requests.exceptions.ConnectionError as ex:
+                time.sleep(1)
+        raise ex
 
 @pytest.fixture(scope='module', params=_fixture_params)
 def dxf_main(request):
@@ -181,6 +193,7 @@ def dxf_main(request):
         'DXF_HOST': 'localhost:5000',
         'DXF_INSECURE': '1' if ((auth is None) or (do_token is None)) else '0',
         'DXF_SKIPTLSVERIFY': '0' if tlsverify else '1',
+        'DXF_TLSVERIFY': os.environ['DXF_TLSVERIFY'],
         'TEST_DO_AUTH': auth,
         'TEST_DO_TOKEN': do_token,
         'REGVER': regver,
@@ -196,11 +209,11 @@ def dxf_main(request):
     for _ in range(5):
         try:
             if do_token is None:
-                with pytest.raises(dxf.exceptions.DXFAuthInsecureError):
-                    dxf.main.doit(['auth', pytest.repo], environ)
+                with pytest.raises(aiodxf.exceptions.DXFAuthInsecureError):
+                    asyncio.run(aiodxf.main.doit(['auth', pytest.repo], environ))
                 return pytest.skip()
 
-            assert dxf.main.doit(['list-repos'], environ) == 0
+            assert asyncio.run(aiodxf.main.doit(['list-repos'], environ)) == 0
 
             return environ
         except requests.exceptions.ConnectionError as ex:

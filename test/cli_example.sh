@@ -4,7 +4,7 @@ HERE="$(cd $(dirname "$0"); echo "$PWD")"
 cd /tmp
 
 dxf() {
-  PYTHONPATH="$HERE/.." python -m dxf "$@"
+  PYTHONPATH="$HERE/.." python -m aiodxf "$@"
 }
 
 cleanup() {
@@ -20,8 +20,8 @@ export DXF_INSECURE=1
 echo '2015-05 11' > logger.dat
 
 
-dxf push-blob fred/datalogger logger.dat @may15-readings
-dxf pull-blob fred/datalogger @may15-readings
+aiodxf push-blob fred/datalogger logger.dat @may15-readings
+aiodxf pull-blob fred/datalogger @may15-readings
 
-dxf set-alias fred/datalogger may15-readings $(dxf push-blob fred/datalogger logger.dat)
-dxf pull-blob fred/datalogger $(dxf get-alias fred/datalogger may15-readings)
+aiodxf set-alias fred/datalogger may15-readings $(aiodxf push-blob fred/datalogger logger.dat)
+aiodxf pull-blob fred/datalogger $(aiodxf get-alias fred/datalogger may15-readings)

@@ -85,13 +85,9 @@ you wish to work with in each case as the second argument.
 If your registry uses SSL with a self-issued certificate, you'll need to supply
 `dxf` with a set of trusted certificate authorities.
 
-Set the `REQUESTS_CA_BUNDLE` environment variable to the path of a PEM file
-containing the trusted certificate authority certificates.
-
-Both the module and command-line tool support `REQUESTS_CA_BUNDLE`.
-
-Alternatively, you can set the `DXF_TLSVERIFY` environment variable for the
-command-line tool or pass the `tlsverify` option to the module.
+You can set the `DXF_TLSVERIFY` environment variable to the path of a PEM file
+containing the trusted certificate authority certificates for the command-line
+tool or pass the `tlsverify` option to the module.
 
 ## Authentication tokens
 
@@ -122,7 +118,7 @@ exit with `EACCES`.
 ## Installation
 
 ```shell
-pip install python-dxf
+pip install aiodxf
 ```
 
 ## Licence
